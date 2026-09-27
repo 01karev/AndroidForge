@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Generate a minimal sample Android project for AndroidForge testing.
+
+Run this script locally, then ZIP the generated directory and drop it into
+input/ to test AndroidForge end-to-end without needing a real project.
+
+Usage:
+    python scripts/generate_sample_project.py --output /tmp/sample-android
+    cd /tmp && zip -r sample-android.zip sample-android
+    cp sample-android.zip <repo>/input/
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import textwrap
+from pathlib import Path
+
+
+def write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(textwrap.dedent(content).lstrip("\n"))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Generate sample Android project")
+    parser.add_argument("--output", required=True, help="Output directory")
+    args = parser.parse_args()
+
+    root = Path(args.output).resolve()
+    if root.exists():
+        print(f"ERROR: {root} already exists", file=sys.stderr)
+        return 1
+    root.mkdir(parents=True)
+
+    # settings.gradle
+    write(root / "settings.gradle", """
+        rootProject.name = "SampleApp"
+        include ':app'
+    """)
+
+    # build.gradle (root)
+    write(root / "build.gradle", """
+        buildscript {
+            ext.kotlin_version = "1.9.22"
+            repositories {
+                google()
+                mavenCentral()
+            }
+            dependencies {
+                classpath "com.android.tools.build:gradle:8.1.4"
+                classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+            }
+        }
+
+        allprojects {
+            repositories {
+                google()
+                mavenCentral()
+            }
+        }
+    """)
+
+    # gradle.properties
+    write(root / "gradle.properties", """
+        org.gradle.jvmargs=-Xmx2048m
+        android.useAndroidX=true
+        kotlin.code.style=official
+    """)
+
+    # app/build.gradle
+    write(root / "app" / "build.gradle", """
+        apply plugin: "com.android.application"
+        apply plugin: "org.jetbrains.kotlin.android"
+
+        android {
+            namespace "com.example.sampleapp"
+            compileSdk 34
+
+            defaultConfig {
+                applicationId "com.example.sampleapp"
+                minSdk 24
+                targetSdk 34
+                versionCode 1
+                versionName "1.0"
+            }
+
+            compileOptions {
+                sourceCompatibility JavaVersion.VERSION_17
+                targetCompatibility JavaVersion.VERSION_17
+            }
+
+            buildTypes {
+                release {
+                    minifyEnabled false
+                }
+            }
+        }
+    """)
+
+    # AndroidManifest.xml
+    write(root / "app" / "src" / "main" / "AndroidManifest.xml", """
+        <?xml version="1.0" encoding="utf-8"?>
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application
+                android:label="SampleApp"
+                android:allowBackup="true"
+                android:icon="@android:drawable/sym_def_app_icon">
+                <activity
+                    android:name=".MainActivity"
+                    android:exported="true">
+                    <intent-filter>
+                        <action android:name="android.intent.action.MAIN" />
+                        <category android:name="android.intent.category.LAUNCHER" />
+                    </intent-filter>
+                </activity>
+            </application>
+        </manifest>
+    """)
+
+    # MainActivity.kt
+    write(root / "app" / "src" / "main" / "java" / "com" / "example" / "sampleapp" / "MainActivity.kt", """
+        package com.example.sampleapp
+
+        import android.app.Activity
+        import android.os.Bundle
+        import android.widget.TextView
+
+        class MainActivity : Activity() {
+            override fun onCreate(savedInstanceState: Bundle?) {
+                super.onCreate(savedInstanceState)
+                val tv = TextView(this)
+                tv.text = "Hello from AndroidForge!"
+                setContentView(tv)
+            }
+        }
+    """)
+
+    # gradle-wrapper.properties
+    write(root / "gradle" / "wrapper" / "gradle-wrapper.properties", """
+        distributionBase=GRADLE_USER_HOME
+        distributionPath=wrapper/dists
+        distributionUrl=https\\://services.gradle.org/distributions/gradle-8.0-bin.zip
+        zipStoreBase=GRADLE_USER_HOME
+        zipStorePath=wrapper/dists
+    """)
+
+    # gradlew (minimal stub — real builds use the gradle-wrapper JAR which
+    # would normally be checked in; AndroidForge regenerates it automatically)
+    write(root / "gradlew", """
+        #!/bin/sh
+        # Minimal stub for source-only distribution. The real gradle-wrapper.jar
+        # is regenerated by AndroidForge via `gradle wrapper` at build time.
+        exec gradle "$@"
+    """)
+
+    # Make gradlew executable
+    (root / "gradlew").chmod(0o755)
+
+    print(f"Sample project created at: {root}")
+    print(f"To use with AndroidForge:")
+    print(f"  cd {root.parent} && zip -r {root.name}.zip {root.name}")
+    print(f"  cp {root.name}.zip <repo>/input/")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
