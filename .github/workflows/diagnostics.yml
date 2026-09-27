@@ -1,0 +1,127 @@
+name: Diagnostics
+
+# AndroidForge — Diagnostics-only workflow
+#
+# This workflow runs ONLY the detection / extraction / setup steps and skips
+# the actual build. It's useful when you want to understand what AndroidForge
+# thinks of a ZIP before committing to a full build (or when troubleshooting
+# why a build isn't picking the right toolchain).
+#
+# Usage:
+#   Actions → "Diagnostics" → Run workflow → choose ZIP source → run.
+#
+# Output:
+#   • A pretty-printed detection JSON (in the workflow log)
+#   • A toolchain JSON (in the workflow log)
+#   • Both saved as a downloadable artifact for later inspection
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_source:
+        description: "Where should the workflow get the source ZIP from?"
+        type: choice
+        required: true
+        default: "input-directory"
+        options:
+          - "input-directory"
+          - "download-url"
+          - "release-asset"
+      zip_url:
+        description: "Direct download URL (if 'download-url' selected)"
+        required: false
+        type: string
+        default: ""
+      release_tag:
+        description: "GitHub Release tag (if 'release-asset' selected)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  diagnose:
+    name: Diagnose project
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: scripts/requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements.txt
+
+      - name: Acquire source ZIP
+        id: acquire
+        run: python scripts/acquire_zip.py
+            --source "${{ inputs.zip_source }}"
+            --url "${{ inputs.zip_url }}"
+            --tag "${{ inputs.release_tag }}"
+
+      - name: Extract source ZIP
+        id: extract
+        run: python scripts/extract_zip.py --zip "${{ steps.acquire.outputs.zip_path }}"
+
+      - name: Detect project
+        id: detect
+        run: |
+          python scripts/detect_project.py --root "${{ steps.extract.outputs.project_root }}" --output detection.json
+          echo "::group::Detection JSON"
+          cat detection.json
+          echo "::endgroup::"
+
+      - name: Configure toolchain (no install)
+        id: toolchain
+        run: |
+          python scripts/setup_environment.py \
+            --root "${{ steps.extract.outputs.project_root }}" \
+            --detect detection.json \
+            --android-sdk "$ANDROID_SDK_ROOT" \
+            > toolchain.json
+          echo "::group::Toolchain JSON"
+          cat toolchain.json
+          echo "::endgroup::"
+
+      - name: Save diagnosis artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AndroidForge-diagnosis
+          path: |
+            detection.json
+            toolchain.json
+          retention-days: 30
+
+      - name: Print quick summary
+        run: |
+          echo "## AndroidForge Diagnosis" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Project type | ${{ steps.detect.outputs.project_type }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Sub-type | ${{ steps.detect.outputs.sub_type }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Structure | ${{ steps.detect.outputs.structure }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Is legacy | ${{ steps.detect.outputs.is_legacy }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| JDK | ${{ steps.toolchain.outputs.jdk_version }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Gradle | ${{ steps.toolchain.outputs.gradle_version }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| AGP | ${{ steps.toolchain.outputs.agp_version }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Kotlin | ${{ steps.toolchain.outputs.kotlin_version }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Needs Flutter | ${{ steps.toolchain.outputs.needs_flutter }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Needs NDK | ${{ steps.toolchain.outputs.needs_ndk }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| NDK version | ${{ steps.toolchain.outputs.ndk_version }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Use wrapper | ${{ steps.toolchain.outputs.use_wrapper }} |" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,341 @@
+name: Build Android APK
+
+# AndroidForge — Universal Android APK Builder
+#
+# Workflow:
+#   1. Acquire source ZIP (input/ dir, public URL, or GitHub Release asset)
+#   2. Extract ZIP to a clean workspace
+#   3. Detect project type (Gradle / Flutter / multi-module / etc.)
+#   4. Configure toolchain (JDK / Gradle / NDK / Flutter) based on detection
+#   5. Install Android SDK components (caching aggressively)
+#   6. Build the project (assembleDebug / assembleRelease / bundleDebug)
+#   7. Collect generated APKs and pick the primary one
+#   8. Upload APK as a GitHub Actions artifact
+#   9. On failure, run automated diagnosis
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_source:
+        description: "Where should the workflow get the source ZIP from?"
+        type: choice
+        required: true
+        default: "input-directory"
+        options:
+          - "input-directory"
+          - "download-url"
+          - "release-asset"
+      zip_url:
+        description: "Direct download URL (only used if 'download-url' is selected)"
+        required: false
+        type: string
+        default: ""
+      release_tag:
+        description: "GitHub Release tag containing the ZIP (only used if 'release-asset' is selected)"
+        required: false
+        type: string
+        default: ""
+      build_variant:
+        description: "Build variant to produce"
+        type: choice
+        required: true
+        default: "auto"
+        options:
+          - "auto"
+          - "debug"
+          - "release"
+          - "bundle"
+      enable_ndk:
+        description: "Install NDK even if no native code is detected (force-true)"
+        type: boolean
+        required: false
+        default: false
+  push:
+    branches:
+      - main
+    paths:
+      - "input/**.zip"
+
+# Never expose secrets to the (untrusted) uploaded source ZIP.
+# We intentionally DO NOT pass any repo secrets into the build steps.
+permissions:
+  contents: read
+  actions: write
+  # No secrets, no id-token — keep the build sandboxed.
+
+concurrency:
+  group: androidforge-build-${{ github.ref }}-${{ github.event.inputs.zip_source || 'auto' }}
+  cancel-in-progress: false
+
+env:
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  ANDROID_HOME: /usr/local/lib/android/sdk
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.caching=false"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      project_type: ${{ steps.detect.outputs.project_type }}
+      build_succeeded: ${{ steps.build.outputs.build_succeeded }}
+      apk_count: ${{ steps.collect.outputs.apk_count }}
+      primary_apk_name: ${{ steps.collect.outputs.primary_apk_name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: scripts/requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements.txt
+
+      # ---------------------------------------------------------------------
+      # Step 1: Acquire ZIP
+      # ---------------------------------------------------------------------
+      - name: Acquire source ZIP
+        id: acquire
+        run: python scripts/acquire_zip.py
+            --source "${{ inputs.zip_source || 'input-directory' }}"
+            --url "${{ inputs.zip_url }}"
+            --tag "${{ inputs.release_tag }}"
+
+      # ---------------------------------------------------------------------
+      # Step 2: Extract ZIP
+      # ---------------------------------------------------------------------
+      - name: Extract source ZIP
+        id: extract
+        run: python scripts/extract_zip.py --zip "${{ steps.acquire.outputs.zip_path }}"
+
+      # ---------------------------------------------------------------------
+      # Step 3: Detect project
+      # ---------------------------------------------------------------------
+      - name: Detect project type
+        id: detect
+        run: |
+          python scripts/detect_project.py --root "${{ steps.extract.outputs.project_root }}" --output detection.json
+          echo "::group::Detection JSON"
+          cat detection.json
+          echo "::endgroup::"
+
+      # ---------------------------------------------------------------------
+      # Step 4: Configure toolchain
+      # ---------------------------------------------------------------------
+      - name: Configure toolchain
+        id: toolchain
+        run: |
+          python scripts/setup_environment.py \
+            --root "${{ steps.extract.outputs.project_root }}" \
+            --detect detection.json \
+            --android-sdk "$ANDROID_SDK_ROOT" \
+            | tee toolchain.json
+          # Extract json to file for downstream steps
+          python -c "import json,sys; d=json.load(open('toolchain.json')); open('toolchain.json','w').write(json.dumps(d,indent=2))"
+          echo "::group::Toolchain JSON"
+          cat toolchain.json
+          echo "::endgroup::"
+
+      # ---------------------------------------------------------------------
+      # Step 5: Install JDK (chosen dynamically by setup step)
+      # ---------------------------------------------------------------------
+      - name: Set up JDK (detected version)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "${{ steps.toolchain.outputs.jdk_version }}"
+          cache: "gradle"
+
+      # For legacy projects, also install JDK 8 as a fallback path
+      - name: Set up JDK 8 (legacy fallback)
+        if: steps.toolchain.outputs.jdk_version == '8'
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "8"
+
+      # ---------------------------------------------------------------------
+      # Step 6: Set up Android SDK
+      # ---------------------------------------------------------------------
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: |
+            tools
+            platform-tools
+            build-tools;34.0.0
+            build-tools;33.0.2
+            build-tools;32.0.0
+            build-tools;30.0.3
+            platforms;android-34
+            platforms;android-33
+            platforms;android-31
+            platforms;android-30
+            platforms;android-29
+            platforms;android-28
+            platforms;android-26
+            platforms;android-25
+
+      # ---------------------------------------------------------------------
+      # Step 7: Install NDK if needed
+      # ---------------------------------------------------------------------
+      - name: Install NDK (detected version)
+        if: steps.toolchain.outputs.needs_ndk == 'true' || github.event.inputs.enable_ndk == 'true'
+        run: |
+          echo "Installing NDK ${{ steps.toolchain.outputs.ndk_version }}"
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;${{ steps.toolchain.outputs.ndk_version }}" || true
+          # Also install CMake
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "cmake;3.22.1" || true
+
+      # ---------------------------------------------------------------------
+      # Step 8: Set up Flutter (if needed)
+      # ---------------------------------------------------------------------
+      - name: Set up Flutter
+        if: steps.toolchain.outputs.needs_flutter == 'true'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "${{ steps.toolchain.outputs.flutter_version }}"
+          channel: "stable"
+          cache: true
+
+      # ---------------------------------------------------------------------
+      # Step 9: Install standalone Gradle (used if wrapper is missing)
+      # ---------------------------------------------------------------------
+      - name: Install standalone Gradle (fallback)
+        if: steps.toolchain.outputs.use_wrapper == 'false'
+        run: |
+          GRADLE_VER="${{ steps.toolchain.outputs.gradle_version }}"
+          echo "Installing Gradle $GRADLE_VER"
+          wget -q "https://services.gradle.org/distributions/gradle-${GRADLE_VER}-bin.zip" -O /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /opt
+          echo "/opt/gradle-${GRADLE_VER}/bin" >> "$GITHUB_PATH"
+
+      # ---------------------------------------------------------------------
+      # Step 10: Cache Gradle dependencies & wrapper
+      # ---------------------------------------------------------------------
+      - name: Cache Gradle dependencies
+        if: steps.toolchain.outputs.needs_gradle == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ${{ steps.extract.outputs.project_root }}/.gradle
+          key: gradle-${{ steps.toolchain.outputs.gradle_version }}-${{ hashFiles('**/build.gradle*', '**/gradle-wrapper.properties', '**/libs.versions.toml') }}
+          restore-keys: |
+            gradle-${{ steps.toolchain.outputs.gradle_version }}-
+            gradle-
+
+      # ---------------------------------------------------------------------
+      # Step 11: Build the project
+      # ---------------------------------------------------------------------
+      - name: Build project
+        id: build
+        continue-on-error: true
+        working-directory: ${{ steps.extract.outputs.project_root }}
+        run: |
+          python "$GITHUB_WORKSPACE/scripts/build_project.py" \
+            --root "${{ steps.extract.outputs.project_root }}" \
+            --detect "$GITHUB_WORKSPACE/detection.json" \
+            --toolchain "$GITHUB_WORKSPACE/toolchain.json" \
+            --variant "${{ inputs.build_variant || 'auto' }}" \
+            --log-dir "$GITHUB_WORKSPACE/.androidforge/logs"
+
+      - name: Mark build as failed for downstream steps
+        if: steps.build.outputs.build_succeeded != 'true'
+        run: |
+          echo "::warning::Build step reported failure or did not succeed."
+          echo "build_failed=true" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------------
+      # Step 12: Collect APKs (even if build partially failed — debug outputs may exist)
+      # ---------------------------------------------------------------------
+      - name: Collect APKs
+        id: collect
+        if: always()
+        run: |
+          python "$GITHUB_WORKSPACE/scripts/collect_apk.py" \
+            --root "${{ steps.extract.outputs.project_root }}" \
+            --variant "${{ inputs.build_variant || 'auto' }}" \
+            --output-dir "$GITHUB_WORKSPACE/output" || true
+
+      # ---------------------------------------------------------------------
+      # Step 13: Upload APK artifact
+      # ---------------------------------------------------------------------
+      - name: Upload APK artifact
+        if: steps.collect.outputs.apk_count != '0' && steps.collect.outputs.apk_count != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: AndroidForge-APKs
+          path: ${{ steps.collect.outputs.apk_directory }}/*.apk
+          if-no-files-found: ignore
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload AAB artifact (if any)
+        if: steps.collect.outputs.apk_count != '0' && steps.collect.outputs.apk_count != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: AndroidForge-AAB
+          path: ${{ steps.collect.outputs.apk_directory }}/*.aab
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # ---------------------------------------------------------------------
+      # Step 14: Upload build logs (always, for debugging)
+      # ---------------------------------------------------------------------
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AndroidForge-logs
+          path: |
+            .androidforge/logs/
+            ${{ steps.extract.outputs.project_root }}/build/
+            ${{ steps.extract.outputs.project_root }}/**/build/reports/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # ---------------------------------------------------------------------
+      # Step 15: Diagnose failure (only on build failure)
+      # ---------------------------------------------------------------------
+      - name: Diagnose failure
+        if: steps.build.outputs.build_succeeded != 'true'
+        run: |
+          python "$GITHUB_WORKSPACE/scripts/diagnose_failure.py" \
+            --root "${{ steps.extract.outputs.project_root }}" \
+            --log-dir "$GITHUB_WORKSPACE/.androidforge/logs" || true
+
+      # ---------------------------------------------------------------------
+      # Step 16: Build summary (always)
+      # ---------------------------------------------------------------------
+      - name: Build summary
+        if: always()
+        run: |
+          python "$GITHUB_WORKSPACE/scripts/build_summary.py" \
+            --detect "$GITHUB_WORKSPACE/detection.json" \
+            --toolchain "$GITHUB_WORKSPACE/toolchain.json" \
+            --build "${{ steps.build.outputs.json || '{}' }}" \
+            --collect "${{ steps.collect.outputs.json || '{}' }}" || true
+
+      # ---------------------------------------------------------------------
+      # Final: fail the job if the build itself failed
+      # ---------------------------------------------------------------------
+      - name: Fail if build failed
+        if: steps.build.outputs.build_succeeded != 'true'
+        run: |
+          echo "::error::Android build failed. See the diagnosis above and the AndroidForge-logs artifact."
+          exit 1

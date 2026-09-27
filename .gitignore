@@ -1,0 +1,39 @@
+# Build outputs
+output/*
+!output/.gitkeep
+
+# Input ZIPs (avoid committing large binaries)
+input/*
+!input/.gitkeep
+
+# AndroidForge workspace (downloaded ZIPs, extracted source, logs)
+.androidforge/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Gradle
+.gradle/
+build/
+*.iml
+local.properties
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local detection / toolchain JSON (generated per-build)
+detection.json
+toolchain.json

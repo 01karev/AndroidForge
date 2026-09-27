@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""AndroidForge — Build Project.
+
+Reads detection + setup JSON and runs the appropriate build command(s) for the
+project. The script is non-destructive: it never modifies source files, only
+runs commands in the project directory.
+
+Strategy:
+  1. If Flutter → `flutter pub get` then `flutter build apk`.
+  2. Otherwise → run gradle tasks (assembleDebug, assembleRelease, bundleDebug)
+     in order until one succeeds. Stop on first success.
+  3. If the gradle wrapper is missing/corrupt, regenerate it with
+     `gradle wrapper --gradle-version <X>` first.
+  4. On success, write the produced command + log path to GITHUB_OUTPUT.
+  5. On failure, exit non-zero so the workflow runs the diagnosis step.
+
+The build is run inside the project root directory and inherits the runner's
+PATH (which includes the JDK and Gradle installed by previous workflow steps).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+def run(cmd: list[str], cwd: Path, log_file: Path, env: dict[str, str] | None = None) -> tuple[int, str]:
+    """Run a command, stream stdout/stderr to console AND a log file."""
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    print(f"\n=== Running: {' '.join(cmd)}", flush=True)
+    print(f"    cwd: {cwd}", flush=True)
+    print(f"    log: {log_file}", flush=True)
+    start = time.time()
+    full_env = os.environ.copy()
+    if env:
+        full_env.update(env)
+
+    with log_file.open("w", encoding="utf-8", errors="replace") as f:
+        f.write(f"$ {' '.join(cmd)}\n")
+        f.write(f"# cwd: {cwd}\n\n")
+        f.flush()
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cwd),
+            env=full_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            f.write(line)
+        rc = proc.wait()
+    elapsed = time.time() - start
+    print(f"=== Exit {rc} after {elapsed:.1f}s", flush=True)
+    return rc, str(log_file)
+
+
+def maybe_regenerate_wrapper(project_root: Path, gradle_version: str | None, log_dir: Path) -> bool:
+    """If gradle-wrapper.jar is missing, run `gradle wrapper` to regenerate."""
+    jar = project_root / "gradle" / "wrapper" / "gradle-wrapper.jar"
+    if jar.exists():
+        return True
+    if not gradle_version:
+        print("WARNING: cannot regenerate wrapper — no Gradle version specified", flush=True)
+        return False
+    cmd = ["gradle", "wrapper", "--gradle-version", gradle_version, "--distribution-type", "bin"]
+    rc, _ = run(cmd, project_root, log_dir / "regenerate-wrapper.log")
+    return rc == 0 and jar.exists()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="AndroidForge build project")
+    parser.add_argument("--root", required=True, help="Project root path")
+    parser.add_argument("--detect", required=True, help="Detection JSON (string or path)")
+    parser.add_argument("--toolchain", required=True, help="Toolchain JSON (string or path)")
+    parser.add_argument("--variant", default="auto", choices=["auto", "debug", "release", "bundle"])
+    parser.add_argument("--log-dir", default=None, help="Directory to write logs")
+    args = parser.parse_args()
+
+    def load(s: str) -> Any:
+        if Path(s).exists():
+            return json.loads(Path(s).read_text())
+        return json.loads(s)
+
+    detect = load(args.detect)
+    toolchain = load(args.toolchain)
+
+    root = Path(args.root).resolve()
+    log_dir = Path(args.log_dir) if args.log_dir else root.parent / "androidforge-logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    project_type = detect.get("project_type", "unknown")
+    needs_gradle = toolchain.get("needs_gradle", False)
+    needs_flutter = toolchain.get("needs_flutter", False)
+    use_wrapper = toolchain.get("use_wrapper", False)
+
+    # Filter build commands based on requested variant
+    all_commands = toolchain.get("build_commands", [])
+    if args.variant != "auto":
+        # Filter by requested variant
+        filtered = []
+        for cmd in all_commands:
+            cmd_str = " ".join(cmd).lower()
+            if args.variant == "debug" and "debug" in cmd_str:
+                filtered.append(cmd)
+            elif args.variant == "release" and "release" in cmd_str:
+                filtered.append(cmd)
+            elif args.variant == "bundle" and "bundle" in cmd_str:
+                filtered.append(cmd)
+        if filtered:
+            all_commands = filtered
+
+    # If we use gradlew, regenerate wrapper if missing
+    if use_wrapper and project_type != "flutter":
+        gradlew = root / "gradlew"
+        if not gradlew.exists():
+            print("WARNING: gradlew missing despite detection — regenerating via system gradle", flush=True)
+            maybe_regenerate_wrapper(root, toolchain.get("gradle_version"), log_dir)
+
+    # Determine env for build
+    build_env: dict[str, str] = {}
+    if needs_flutter:
+        # Flutter requires Java 17 for Android builds
+        pass
+
+    # Run build
+    success = False
+    last_rc = 1
+    last_log: str = ""
+    successful_command: list[str] | None = None
+
+    for cmd in all_commands:
+        # For gradlew commands, make sure it's executable
+        if use_wrapper and cmd and cmd[0].endswith("gradlew"):
+            gradlew_path = Path(cmd[0])
+            if gradlew_path.exists():
+                gradlew_path.chmod(0o755)
+        rc, log = run(cmd, root, log_dir / f"build-{int(time.time())}-{len(cmd)}.log", build_env)
+        last_rc = rc
+        last_log = log
+        if rc == 0:
+            success = True
+            successful_command = cmd
+            break
+
+    # Output JSON summary
+    result = {
+        "project_root": str(root),
+        "project_type": project_type,
+        "build_succeeded": success,
+        "successful_command": successful_command,
+        "exit_code": last_rc,
+        "log_file": last_log,
+        "build_commands_attempted": all_commands,
+    }
+    print(json.dumps(result, indent=2))
+
+    gh_output = os.environ.get("GITHUB_OUTPUT")
+    if gh_output:
+        with open(gh_output, "a", encoding="utf-8") as f:
+            f.write(f"build_succeeded={'true' if success else 'false'}\n")
+            f.write(f"exit_code={last_rc}\n")
+            f.write(f"log_file={last_log}\n")
+            if successful_command:
+                f.write(f"successful_command={' '.join(successful_command)}\n")
+            f.write(f"json<<EOF\n{json.dumps(result)}\nEOF\n")
+
+    return 0 if success else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
