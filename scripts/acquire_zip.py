@@ -35,10 +35,18 @@ INPUT_DIR = REPO_ROOT / "input"
 def find_input_zip() -> Path | None:
     if not INPUT_DIR.exists():
         return None
-    for p in INPUT_DIR.iterdir():
-        if p.is_file() and p.suffix.lower() == ".zip":
-            return p
-    return None
+
+    candidates = [
+        p for p in INPUT_DIR.iterdir()
+        if p.is_file()
+        and p.suffix.lower() == ".zip"
+        and "mdmesh" in p.name.lower()
+    ]
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
 def download(url: str, dest: Path) -> None:
