@@ -182,8 +182,233 @@ def apply_fixes(detect: dict, fixes: list[dict], android_sdk_root: str) -> list[
             # The workflow will run `gradle wrapper` to regenerate; we just flag it.
             applied.append("Flagged wrapper for regeneration via `gradle wrapper`")
 
+    # ---- Always ensure gradle.properties has a reasonable JVM heap ----
+    # The GitHub-hosted ubuntu-latest runner has ~7 GB RAM. The Gradle
+    # daemon's default heap is often too small for Flutter / multi-module
+    # projects, leading to "Gradle build daemon has been stopped: since
+    # the JVM garbage collector is thrashing" during flutter build apk.
+    # We inject `org.gradle.jvmargs=-Xmx4g` in THREE places:
+    #   1. <project_root>/gradle.properties  (root-level, for plain Gradle projects)
+    #   2. <project_root>/android/gradle.properties  (Flutter projects invoke Gradle from android/)
+    #   3. ~/.gradle/gradle.properties  (global, applies to ALL Gradle invocations)
+    HEAP_LINE = "org.gradle.jvmargs=-Xmx4g -XX:+UseG1GC -Dfile.encoding=UTF-8"
+    # AndroidX is required by most modern Flutter plugins. If a project
+    # doesn't enable it explicitly, Gradle aborts with:
+    #   "Configuration :app:debugRuntimeClasspath contains AndroidX
+    #    dependencies, but the android.useAndroidX property is not enabled."
+    # We proactively set useAndroidX=true + enableJetifier=true so legacy
+    # support-library references are auto-migrated. Both flags are no-ops
+    # for projects that already use AndroidX, so this is safe to set always.
+    ANDROIDX_LINES = [
+        "android.useAndroidX=true",
+        "android.enableJetifier=true",
+    ]
+
+    def _inject_gradle_properties(props_path: Path, location_label: str) -> None:
+        if props_path.exists():
+            content = props_path.read_text(encoding="utf-8", errors="replace")
+            changes: list[str] = []
+            # Handle jvmargs
+            m = re.search(r"^org\.gradle\.jvmargs\s*=\s*(.+)$", content, re.MULTILINE)
+            if m:
+                existing = m.group(1).strip()
+                heap_match = re.search(r"-Xmx(\d+)([gm])", existing, re.IGNORECASE)
+                if heap_match:
+                    size = int(heap_match.group(1))
+                    unit = heap_match.group(2).lower()
+                    existing_mb = size * (1024 if unit == "g" else 1)
+                    if existing_mb < 4096:
+                        new_content = re.sub(
+                            r"^org\.gradle\.jvmargs\s*=.*$",
+                            HEAP_LINE,
+                            content,
+                            flags=re.MULTILINE,
+                        )
+                        if new_content != content:
+                            content = new_content
+                            changes.append(f"bumped jvmargs from '{existing}'")
+                # else: heap is already >= 4g, leave alone
+            else:
+                content += f"\n# AndroidForge: ensure enough heap for the Gradle daemon\n{HEAP_LINE}\n"
+                changes.append("added jvmargs")
+            # Handle android.useAndroidX
+            if not re.search(r"^android\.useAndroidX\s*=", content, re.MULTILINE):
+                content += f"\n# AndroidForge: enable AndroidX (most Flutter plugins need it)\n"
+                for line in ANDROIDX_LINES:
+                    content += f"{line}\n"
+                changes.append("added useAndroidX=true + enableJetifier=true")
+            if changes:
+                props_path.write_text(content)
+                applied.append(f"Updated {location_label}: {', '.join(changes)}")
+        else:
+            props_path.parent.mkdir(parents=True, exist_ok=True)
+            content = (
+                f"# AndroidForge: ensure enough heap for the Gradle daemon\n"
+                f"{HEAP_LINE}\n"
+                f"org.gradle.daemon=false\n"
+                f"\n# AndroidForge: enable AndroidX (most Flutter plugins need it)\n"
+            )
+            for line in ANDROIDX_LINES:
+                content += f"{line}\n"
+            props_path.write_text(content)
+            applied.append(f"Created {location_label} with jvmargs + useAndroidX + enableJetifier")
+
+    # 1. Project root gradle.properties
+    _inject_gradle_properties(root / "gradle.properties", "gradle.properties (root)")
+    # 2. For Flutter projects: android/gradle.properties (this is the one
+    #    Gradle actually reads when invoked from the android/ subdir).
+    android_dir = root / "android"
+    if android_dir.is_dir():
+        _inject_gradle_properties(android_dir / "gradle.properties", "android/gradle.properties (Flutter)")
+    # 3. Global gradle.properties in the user's home — applies to ALL
+    #    Gradle invocations on the runner regardless of project.
+    home_gradle = Path.home() / ".gradle" / "gradle.properties"
+    _inject_gradle_properties(home_gradle, "~/.gradle/gradle.properties (global)")
+
+    # ---- Inject common public Maven repos (JitPack, Google, mavenCentral) ----
+    # Many projects (especially Flutter plugins) depend on libraries hosted
+    # on JitPack (group ID starts with 'com.github.'). If the project's
+    # build.gradle / settings.gradle doesn't declare the JitPack repo, the
+    # build fails with "Could not find com.github.foo:bar:x.y.z".
+    # We proactively inject these repos into the project's gradle files.
+    _inject_repositories(root, applied, is_flutter=bool((detect.get("flutter") or {}).get("is_flutter")))
+
     # Always disable build cache & parallel for very old gradle (safer)
     return applied
+
+
+def _inject_repositories(root: Path, applied: list[str], is_flutter: bool) -> None:
+    """Inject JitPack / Google / mavenCentral into the project's gradle files
+    if not already declared. Non-destructive: only adds, never removes.
+
+    Smart about RepositoriesMode: if the project's settings.gradle(.kts)
+    declares `FAIL_ON_PROJECT_REPOS` or `PREFER_SETTINGS` (the modern Gradle
+    convention), we ONLY inject into settings.gradle's
+    `dependencyResolutionManagement { repositories { } }` block — never into
+    build.gradle. Injecting project-level repos when the build is configured
+    to forbid them causes Gradle to fail with:
+      "Build was configured to prefer settings repositories over project
+       repositories but repository 'maven' was added by build file 'build.gradle'"
+    """
+    # First, scan all settings.gradle files for RepositoriesMode declarations.
+    # If any of them use FAIL_ON_PROJECT_REPOS or PREFER_SETTINGS, we MUST NOT
+    # inject into any build.gradle file.
+    settings_files = [
+        root / "settings.gradle",
+        root / "settings.gradle.kts",
+        root / "android" / "settings.gradle",
+        root / "android" / "settings.gradle.kts",
+    ]
+    forbid_project_repos = False
+    for sf in settings_files:
+        if not sf.exists():
+            continue
+        content = sf.read_text(encoding="utf-8", errors="replace")
+        if "FAIL_ON_PROJECT_REPOS" in content or "PREFER_SETTINGS" in content:
+            forbid_project_repos = True
+            break
+
+    # Build the candidate list. If the project forbids project-level repos,
+    # we restrict to settings.gradle files only.
+    candidates: list[Path] = []
+    if is_flutter:
+        candidates = [
+            root / "android" / "build.gradle",
+            root / "android" / "build.gradle.kts",
+            root / "android" / "settings.gradle",
+            root / "android" / "settings.gradle.kts",
+        ]
+    candidates += [
+        root / "build.gradle",
+        root / "build.gradle.kts",
+        root / "settings.gradle",
+        root / "settings.gradle.kts",
+    ]
+    # If the project forbids project-level repos, filter out build.gradle files.
+    if forbid_project_repos:
+        candidates = [c for c in candidates if not c.name.startswith("build.gradle")]
+
+    REPO_LINES_KTS = [
+        'maven { url = uri("https://maven.google.com") }',
+        'mavenCentral()',
+        'maven { url = uri("https://plugins.gradle.org/m2") }',
+        'maven { url = uri("https://jitpack.io") }',
+    ]
+    REPO_LINES_GROOVY = [
+        'maven { url \'https://maven.google.com\' }',
+        'mavenCentral()',
+        'maven { url \'https://plugins.gradle.org/m2\' }',
+        'maven { url \'https://jitpack.io\' }',
+    ]
+
+    for grad in candidates:
+        if not grad.exists():
+            continue
+        content = grad.read_text(encoding="utf-8", errors="replace")
+        # Skip if all repos are already declared anywhere in the file.
+        already_has = (
+            "jitpack.io" in content
+            and "maven.google.com" in content
+            and "mavenCentral()" in content
+        )
+        if already_has:
+            continue
+        # Try to find a `repositories { ... }` block and append our repos
+        # just before its closing brace.
+        is_kts = grad.name.endswith(".kts")
+        repo_lines = REPO_LINES_KTS if is_kts else REPO_LINES_GROOVY
+        # Process matches in REVERSE order so earlier insertions don't
+        # invalidate the close_idx of later matches. (Each insertion shifts
+        # content after it; processing from end→start keeps earlier indices
+        # valid.)
+        matches = list(re.finditer(r"repositories\s*\{", content, re.IGNORECASE))
+        matches.reverse()
+        new_content = content
+        injected = False
+        for m in matches:
+            # Find the matching closing brace by counting, starting from
+            # the end of the 'repositories {' match.
+            start = m.end()
+            depth = 1
+            i = start
+            while i < len(new_content) and depth > 0:
+                ch = new_content[i]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                i += 1
+            if depth != 0:
+                continue
+            close_idx = i - 1
+            # Check which repos are missing from THIS block.
+            block_content = new_content[start:close_idx]
+            missing = []
+            for line, marker in zip(repo_lines, ["maven.google.com", "mavenCentral()", "plugins.gradle.org", "jitpack.io"]):
+                if marker not in block_content:
+                    missing.append(line)
+            if not missing:
+                continue
+            inject_text = "\n        // AndroidForge: ensure common public Maven repos\n        " + "\n        ".join(missing) + "\n"
+            # Insert just before the closing brace of this block.
+            new_content = new_content[:close_idx] + inject_text + new_content[close_idx:]
+            injected = True
+        if not injected and not forbid_project_repos:
+            # Strategy 2: append a top-level allprojects block.
+            # ONLY do this if the project doesn't forbid project-level repos
+            # (otherwise we'd cause the same FAIL_ON_PROJECT_REPOS conflict).
+            # Also, allprojects {} is invalid in settings.gradle — only
+            # append to build.gradle files.
+            if grad.name.startswith("build.gradle"):
+                block = "\n\n// AndroidForge: ensure common public Maven repos\nallprojects {\n    repositories {\n"
+                for line in repo_lines:
+                    block += "        " + line + "\n"
+                block += "    }\n}\n"
+                new_content = content + block
+                injected = True
+        if injected and new_content != content:
+            grad.write_text(new_content)
+            applied.append(f"Injected JitPack/Google/mavenCentral into {grad.relative_to(root) if grad.is_relative_to(root) else grad}")
 
 
 def main() -> int:
@@ -244,10 +469,16 @@ def main() -> int:
     fixes = determine_legacy_fixes(detect, rules)
     applied_fixes = apply_fixes(detect, fixes, args.android_sdk)
 
-    # Decide build commands
+    # Decide build commands. Prep commands run unconditionally first (e.g.
+    # `flutter pub get` to download dependencies); build commands are tried
+    # in order and the first one to succeed marks the build as successful.
+    # Prep commands must NOT be in build_commands — otherwise build_project.py
+    # would stop on `flutter pub get` (which exits 0 without producing an APK)
+    # and never actually run `flutter build apk`.
+    prep_commands: list[list[str]] = []
     if needs_flutter:
+        prep_commands = [["flutter", "pub", "get"]]
         build_commands = [
-            ["flutter", "pub", "get"],
             ["flutter", "build", "apk", "--debug"],
             ["flutter", "build", "apk", "--release"],
         ]
@@ -274,6 +505,7 @@ def main() -> int:
         "needs_ndk": needs_ndk,
         "needs_gradle": detect.get("project_type") in ("gradle", "flutter"),
         "legacy_fixes_applied": applied_fixes,
+        "prep_commands": prep_commands,
         "build_commands": build_commands,
     }
 

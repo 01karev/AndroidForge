@@ -103,13 +103,16 @@ DIAGNOSTICS: list[dict[str, Any]] = [
         "label": "Kotlin compilation failure",
         "patterns": [
             r"e:.*\.kt:\(\d+,\d+\):",
+            r"e: file://.*\.kt:\d+:\d+",
+            r"e: .*\.kt:\d+:\d+",
             r"Compilation error.*Kotlin",
             r"kotlin compilation",
             r"kotlinc",
             r"Cannot inline bytecode built with",
+            r"Redeclaration:",
+            r"Duplicate class",
         ],
-        "hint": "Kotlin source failed to compile. Look for 'e: file.kt:' lines in the log for the "
-                "exact location. May also indicate Kotlin/Java version mismatch.",
+        "hint": "Kotlin source failed to compile. Look for 'e: file.kt:line:col' lines in the log for the exact location. May also indicate Kotlin/Java version mismatch, duplicate class definitions across source directories, or unresolved references.",
     },
     {
         "label": "Java compilation failure",
@@ -294,6 +297,30 @@ def render_summary(diag: dict[str, Any], log_path: Path) -> str:
     else:
         lines.append("No known error signatures matched the build log. Please read it manually.")
         lines.append("")
+
+    # Surface actual Kotlin / Java compile errors (the 'e:' / 'error:' lines)
+    # — these are the single most useful thing to debug project-level issues.
+    try:
+        content = log_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        content = ""
+    compile_errors: list[str] = []
+    for m in re.finditer(r"^(e: .*?\.kt[:\(]\d+.*|error: .*|.*\.java:\d+: error:.*)$", content, re.MULTILINE):
+        line = m.group(0).strip()
+        # Strip the leading timestamp/runner prefix if present.
+        line = re.sub(r"^[\d\-T:.Z]+\s+", "", line)
+        if line and line not in compile_errors:
+            compile_errors.append(line)
+        if len(compile_errors) >= 20:
+            break
+    if compile_errors:
+        lines.append("### Compile errors (from the build log)")
+        lines.append("```")
+        for err in compile_errors[:20]:
+            lines.append(err)
+        lines.append("```")
+        lines.append("")
+
     lines.append(f"### Build log")
     lines.append(f"Full log saved as a workflow artifact: `{log_path}`")
     return "\n".join(lines)
@@ -304,11 +331,21 @@ def main() -> int:
     parser.add_argument("--root", required=True, help="Project root path (used to find log dir)")
     parser.add_argument("--variant", default="auto")
     parser.add_argument("--log-file", default=None, help="Explicit path to build log")
+    parser.add_argument("--log-dir", default=None,
+                        help="Directory containing build-*.log files. If --log-file is not "
+                             "provided, the most recent log in this dir is used.")
     args = parser.parse_args()
 
     log_path: Path
     if args.log_file:
         log_path = Path(args.log_file)
+    elif args.log_dir:
+        log_dir = Path(args.log_dir)
+        candidates = sorted(log_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True) if log_dir.exists() else []
+        if not candidates:
+            print(f"ERROR: no build logs found in {log_dir}", file=sys.stderr)
+            return 1
+        log_path = candidates[0]
     else:
         # Find the most recent build log
         log_dir = Path(args.root).parent / "androidforge-logs"
