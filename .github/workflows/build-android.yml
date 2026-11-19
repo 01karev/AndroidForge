@@ -403,13 +403,27 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install Android Build Tools
+        shell: bash
         run: |
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager "build-tools;35.0.0"
+          set -euo pipefail
+
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::Android SDK manager not found"
+            exit 1
+          fi
+
+          echo "Using SDK Manager: $SDKMANAGER"
+
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
+
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" "build-tools;35.0.0"
+
+          test -x "$ANDROID_HOME/build-tools/35.0.0/apksigner"
 
       - name: Sign and verify APKs
         env:
