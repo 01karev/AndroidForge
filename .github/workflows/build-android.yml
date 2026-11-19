@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     container: ghcr.io/professional-x/androidforge-build-env:latest
     timeout-minutes: 60
-  env:
+    env:
       ANDROID_HOME: /opt/android-sdk
       ANDROID_SDK_ROOT: /opt/android-sdk
       JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
