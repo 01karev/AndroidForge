@@ -460,17 +460,18 @@ jobs:
 
           for APK in "${APK_FILES[@]}"; do
             NAME=$(basename "$APK")
-            echo "Signing $NAME"
+            SIGNED_NAME="${NAME/-unsigned/}"
+            echo "Signing $NAME -> $SIGNED_NAME"
 
             "$APKSIGNER" sign \
               --ks "$KEYSTORE" \
               --ks-key-alias mdmesh \
               --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
               --key-pass env:ANDROID_KEY_PASSWORD \
-              --out "signed/$NAME" \
+              --out "signed/$SIGNED_NAME" \
               "$APK"
 
-            "$APKSIGNER" verify --verbose "signed/$NAME"
+            "$APKSIGNER" verify --verbose "signed/$SIGNED_NAME"
           done
 
           rm -f "$KEYSTORE"
